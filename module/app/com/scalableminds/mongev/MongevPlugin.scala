@@ -13,18 +13,21 @@
 package com.scalableminds.mongev
 
 import java.io._
+
 import play.api._
 import play.api.libs.Codecs._
 import play.api.libs.Collections
+
 import scala.io.Source
 import scala.util.control.NonFatal
 import play.core.HandleWebCommandSupport
 import play.api.libs.json._
-import play.api.libs.Files.TemporaryFile
-import org.slf4j.LoggerFactory
 import java.nio.file.Files
-
 import javax.inject.Inject
+
+import play.api.inject.ApplicationLifecycle
+
+import scala.concurrent.Future
 
 /**
  * An DB evolution - database changes associated with a software version.
@@ -192,7 +195,7 @@ private[mongev] trait MongoScriptExecutor extends MongevLogger {
     val jsPath = input.toAbsolutePath.toString
 
     val processLogger = new StringListLogger
-    val result = startProcess(mongoCmd, s"--quiet $jsPath") ! (processLogger)
+    val result = startProcess(mongoCmd, s"--quiet $jsPath") ! processLogger
 
     val output = processLogger.messages.reverse.mkString("\n")
 
@@ -229,14 +232,14 @@ trait Evolutions extends MongoScriptExecutor with EvolutionHelperScripts with Mo
   /**
    * Apply pending evolutions for the given DB.
    */
-  def applyFor(path: java.io.File = new java.io.File(".")) {
+  /*def applyFor(path: java.io.File = new java.io.File(".")) {
     Play.current.plugin[MongevPlugin] map {
       plugin =>
         val script = evolutionScript(path, plugin.getClass.getClassLoader)
         applyScript(script)
     }
   }
-
+*/
   /**
    * Updates a local (file-based) evolution script.
    */
@@ -491,8 +494,8 @@ trait Evolutions extends MongoScriptExecutor with EvolutionHelperScripts with Mo
 
         Evolution(
           revision,
-          parsed.get(UPS).getOrElse(""),
-          parsed.get(DOWNS).getOrElse(""))
+          parsed.getOrElse(UPS, ""),
+          parsed.getOrElse(DOWNS, ""))
       }
     }.reverse
 
@@ -500,16 +503,17 @@ trait Evolutions extends MongoScriptExecutor with EvolutionHelperScripts with Mo
 
 }
 
+trait MongevPlugin
 /**
  * Play Evolutions plugin.
  */
-class MongevPlugin @Inject() (implicit app: Application) extends Plugin with HandleWebCommandSupport with MongevLogger with Evolutions {
+class MongevPluginImpl @Inject() (implicit app: Application, lifecycle: ApplicationLifecycle, configuration: Configuration) extends MongevPlugin with HandleWebCommandSupport with MongevLogger with Evolutions {
 
 
   /**
    * The address of the mongodb server
    */
-  lazy val mongoCmd = app.configuration.getString("mongodb.evolution.mongoCmd").getOrElse(
+  lazy val mongoCmd = configuration.getString("mongodb.evolution.mongoCmd").getOrElse(
     throw new Exception("There is no mongodb.evolution.mongoCmd configuration available. " +
       "You need to declare informations about your mongo cmd in your configuration. E.g. \"mongo localhost:3232/myApp\""))
 
@@ -520,42 +524,40 @@ class MongevPlugin @Inject() (implicit app: Application) extends Plugin with Han
    * mongodb.evolution.enabled = true
    * }}}
    */
-  override lazy val enabled = app.configuration.getBoolean("mongodb.evolution.enabled").getOrElse(false)
+  lazy val enabled = configuration.getBoolean("mongodb.evolution.enabled").getOrElse(false)
 
-  lazy val applyDownEvolutions = app.configuration.getBoolean("mongodb.evolution.applyDownEvolutions").getOrElse(false)
-  lazy val compareHashes = app.configuration.getBoolean("mongodb.evolution.compareHashes").getOrElse(true)
-  lazy val applyProdEvolutions = app.configuration.getBoolean("mongodb.evolution.applyProdEvolutions").getOrElse(false)
+  lazy val applyDownEvolutions = configuration.getBoolean("mongodb.evolution.applyDownEvolutions").getOrElse(false)
+  lazy val compareHashes = configuration.getBoolean("mongodb.evolution.compareHashes").getOrElse(true)
+  lazy val applyProdEvolutions = configuration.getBoolean("mongodb.evolution.applyProdEvolutions").getOrElse(false)
 
   /**
    * Checks the evolutions state.
    */
-  override def onStart() {
-    withLock {
-      val script = evolutionScript(app.path, app.classloader)
-      val hasDown = script.exists(_.isInstanceOf[DownScript])
+  withLock {
+    val script = evolutionScript(app.path, app.classloader)
+    val hasDown = script.exists(_.isInstanceOf[DownScript])
 
-      if (!script.isEmpty) {
-        app.mode match {
-          case Mode.Test => applyScript(script)
-          case Mode.Dev => applyScript(script)
-          case Mode.Prod if applyProdEvolutions && (applyDownEvolutions || !hasDown) => applyScript(script)
-          case Mode.Prod if applyProdEvolutions && hasDown => {
-            logger.warn("Your production database needs evolutions, including downs! \n\n" + toHumanReadableScript(script))
-            logger.warn("Run with -Dmongodb.evolution.applyProdEvolutions=true and " +
-              "-Dmongodb.evolution.applyDownEvolutions=true if you want to run them automatically, " +
-              "including downs (be careful, especially if your down evolutions drop existing data)")
+    if (script.nonEmpty) {
+      app.mode match {
+        case Mode.Test => applyScript(script)
+        case Mode.Dev => applyScript(script)
+        case Mode.Prod if applyProdEvolutions && (applyDownEvolutions || !hasDown) => applyScript(script)
+        case Mode.Prod if applyProdEvolutions && hasDown => {
+          logger.warn("Your production database needs evolutions, including downs! \n\n" + toHumanReadableScript(script))
+          logger.warn("Run with -Dmongodb.evolution.applyProdEvolutions=true and " +
+            "-Dmongodb.evolution.applyDownEvolutions=true if you want to run them automatically, " +
+            "including downs (be careful, especially if your down evolutions drop existing data)")
 
-            throw InvalidDatabaseRevision(toHumanReadableScript(script))
-          }
-          case Mode.Prod => {
-            logger.warn("Your production database needs evolutions! \n\n" + toHumanReadableScript(script))
-            logger.warn("Run with -Dmongodb.evolution.applyProdEvolutions=true " +
-              "if you want to run them automatically (be careful)")
-
-            throw InvalidDatabaseRevision(toHumanReadableScript(script))
-          }
-          case _ => throw InvalidDatabaseRevision(toHumanReadableScript(script))
+          throw InvalidDatabaseRevision(toHumanReadableScript(script))
         }
+        case Mode.Prod => {
+          logger.warn("Your production database needs evolutions! \n\n" + toHumanReadableScript(script))
+          logger.warn("Run with -Dmongodb.evolution.applyProdEvolutions=true " +
+            "if you want to run them automatically (be careful)")
+
+          throw InvalidDatabaseRevision(toHumanReadableScript(script))
+        }
+        case _ => throw InvalidDatabaseRevision(toHumanReadableScript(script))
       }
     }
   }
@@ -586,6 +588,11 @@ class MongevPlugin @Inject() (implicit app: Application) extends Plugin with Han
       }
     } else
       block
+
+    lifecycle.addStopHook { () =>
+      // previous contents of Plugin.onStop
+      Future.successful(())
+    }
   }
 
   def handleWebCommand(request: play.api.mvc.RequestHeader, buildLink: play.core.BuildLink, path: java.io.File): Option[play.api.mvc.Result] = {
@@ -629,7 +636,7 @@ object OfflineEvolutions extends MongevLogger {
 
   def Evolutions(appPath: File) = new Evolutions {
     val compareHashes = false
-    def mongoCmd = Configuration.load(appPath).getString("mongodb.evolution.mongoCmd").get
+    def mongoCmd = ""
   }
 
   private def isTest: Boolean = Play.maybeApplication.exists(_.mode == Mode.Test)
